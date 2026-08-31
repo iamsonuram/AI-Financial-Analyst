@@ -1,0 +1,9 @@
+pandas
+numpy
+matplotlib
+streamlit
+openai
+python-dotenv
+sqlalchemy
+tabulate
+plotly
