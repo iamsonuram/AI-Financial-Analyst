@@ -138,6 +138,7 @@ defaults = {
     "custom_open": False,
     "custom_from_date": None,
     "custom_to_date": None,
+    "enhanced_commentary": None,
 }
 
 for key, value in defaults.items():
@@ -233,6 +234,7 @@ if not st.session_state.analysis_started:
             st.session_state.custom_open = False
             st.session_state.custom_from_date = None
             st.session_state.custom_to_date = None
+            st.session_state.enhanced_commentary = None
             st.session_state.analysis_started = True
             st.rerun()
 
@@ -268,14 +270,21 @@ else:
     left, right = st.columns([2.5, 1])
 
     with left:
-        st.subheader("Executive Commentary")
-        commentary_placeholder = st.empty()
+        st.subheader("✨ Executive Commentary")
+        exec_placeholder = st.empty()
+
+        if st.session_state.get("enhanced_commentary"):
+            with exec_placeholder:
+                display_commentary(st.session_state["enhanced_commentary"])
+
+        st.subheader("📊 Detailed Analysis")
+        detail_placeholder = st.empty()
 
         if st.session_state.analysis_response:
-            previous_commentary = st.session_state.analysis_response.get("commentary")
-            if previous_commentary:
-                with commentary_placeholder:
-                    display_commentary(previous_commentary)
+            detailed = st.session_state.analysis_response.get("commentary")
+            if detailed:
+                with detail_placeholder:
+                    display_commentary(detailed)
 
     with right:
 
@@ -742,8 +751,10 @@ else:
         st.session_state.investigation_states = {}
         st.session_state.analysis_period = None
         st.session_state.analysis_running = True
+        st.session_state.enhanced_commentary = None
 
-        commentary_placeholder.empty()
+        detail_placeholder.empty()
+        exec_placeholder.empty()
 
         # ------------------------------------------------
         # Period resolution
@@ -947,7 +958,7 @@ else:
             elif event_type == "commentary_ready":
                 commentary = event.get("commentary")
                 if commentary:
-                    with commentary_placeholder:
+                    with detail_placeholder:
                         display_commentary(commentary)
 
             elif event_type == "error":
@@ -1002,3 +1013,42 @@ else:
                 st.metric("Investigations", response.get("investigations", 0))
         else:
             st.error(response.get("message", "The analyst could not complete the analysis."))
+
+        # Automatically craft the polished, story-style Executive Commentary
+        # from the market KPIs and the detailed analysis, then show both
+        # together on the UI.
+        if response.get("success") and response.get("commentary"):
+            dashboard = st.session_state.dashboard or {}
+            kpis = {
+                "Actual Technical Result": format_million(dashboard.get("Actual_TR")),
+                "Actual Premium": format_million(dashboard.get("Actual_Premium")),
+                "New Business Expected TR": format_million(
+                    dashboard.get("NB_Expected_TR")
+                ),
+                "New Business Expected Premium": format_million(
+                    dashboard.get("NB_Expected_Premium")
+                ),
+                "Technical Combined Ratio (TCR)": (
+                    f"{dashboard['TCR'] * 100:.1f}%"
+                    if dashboard.get("TCR") is not None else "N/A"
+                ),
+            }
+            with st.spinner("✨ Crafting the Executive Commentary..."):
+                try:
+                    orchestrator = AnalystOrchestrator()
+                    enhanced = orchestrator.polish_commentary(
+                        region=st.session_state.region,
+                        market_unit=st.session_state.market_unit,
+                        comparison_label=response.get("period") or "this period",
+                        market_unit_kpis=kpis,
+                        detailed_commentary=response.get("commentary", ""),
+                    )
+                    st.session_state.enhanced_commentary = enhanced
+                except Exception as exc:
+                    st.session_state.enhanced_commentary = (
+                        f"Enhancement failed: {exc}"
+                    )
+
+        # Re-render so the left column refreshes with the new response, the
+        # polished Executive Commentary and the Detailed Analysis together.
+        st.rerun()

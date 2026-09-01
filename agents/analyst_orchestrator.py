@@ -869,6 +869,118 @@ Do not mention SQL or the investigation process.
         return clean_commentary_text(response)
 
     # =========================================================
+    # POLISHED EXECUTIVE COMMENTARY (STORY)
+    # =========================================================
+
+    def polish_commentary(
+        self,
+        region,
+        market_unit,
+        comparison_label,
+        market_unit_kpis,
+        detailed_commentary,
+    ):
+        """
+        Turn the market-level KPIs and the detailed driver analysis into a
+        polished, story-style executive commentary a reader can grasp quickly.
+
+        The detailed analysis is used as the ground truth so the polished
+        version never contradicts the numeric drill-down. The KPIs form the
+        crisp market snapshot (premium, Technical Result, TCR and new-business
+        expected figures) that opens the story.
+        """
+        kpi_lines = []
+        if market_unit_kpis:
+            for label, value in market_unit_kpis.items():
+                kpi_lines.append(f"- {label}: {str(value).strip()[:100]}")
+        kpi_text = "\n".join(kpi_lines) if kpi_lines else "No KPIs available."
+
+        if not detailed_commentary:
+            detailed_commentary = "No detailed analysis available."
+
+        prompt = f"""
+You are an executive business storyteller, not a data summarizer.
+Transform the analytical output below into a short, clear Executive Commentary
+that explains what happened in this market and why.
+Write for a business user who may not be an insurance/reinsurance expert.
+The reader should understand the story without needing to interpret tables or
+numbers.
+
+Market Unit: {market_unit}
+Region: {region}
+Comparison period: {comparison_label}
+
+MARKET-LEVEL KPIs (dashboard snapshot)
+=======================================
+{kpi_text}
+=======================================
+
+DETAILED ANALYSIS (ground truth; do not contradict it)
+=======================================
+{detailed_commentary}
+=======================================
+
+Follow this structure naturally:
+
+1. Start with the current quarter's overall performance and compare it with the
+   previous quarter.
+2. Explain the main reason for the change.
+3. Identify the 2-3 Lines of Business that contributed most and briefly explain
+   what happened within them.
+4. Mention portfolio or account/cedent-level drivers only when they materially
+   explain the movement. Do not list every portfolio or cedent.
+5. Explain whether the change is mainly related to new business, renewals,
+   cancellations, claims, or premium movement.
+6. End with a concise business takeaway or area that deserves attention.
+
+WRITING RULES
+- Tell a story, do not reproduce the analysis.
+- Prioritize meaning over numbers. Use numbers only when they help explain the
+  story. Format values in readable units such as $1.23B, $45.6M and 79.3%.
+- Use simple, natural business language. Avoid jargon where possible; if an
+  insurance term is necessary, make its meaning clear from context.
+- Do not use phrases such as "the data indicates", "signalling that",
+  "collectively contributed", "material deterioration" or "underwriting
+  criteria" unless clearly supported and necessary.
+- Do not list long sequences of portfolios or cedents.
+- Do not repeat information already obvious from the KPI cards.
+- Keep the commentary concise: 3-5 short paragraphs, approximately 250-350
+  words maximum.
+- Use clear transitions such as "The main concern...", "Most of the decline
+  came from...", "At the portfolio level..." and "Overall...".
+- Make the commentary understandable to someone seeing the market for the
+  first time.
+- Be balanced: clearly distinguish between what is performing well and what
+  requires attention.
+- Do not exaggerate a decline or describe a market as weak if the underlying
+  KPIs show it remains profitable.
+- Do not invent causes, recommendations, relationships, or facts that are not
+  present in the analytical input. Do not make assumptions beyond the supplied
+  analysis.
+- Preserve all important figures accurately. Never change, calculate, or infer
+  a number unless it is explicitly provided in the input.
+
+Above all, answer this question through the narrative:
+
+"What happened in this market this quarter, what caused it, where did it
+happen, and what should the reader pay attention to?"
+
+FORMATTING
+- Do not use Markdown, bullets, asterisks, backticks, tables, headings or
+  emojis. Return plain text only.
+- Start with exactly this one-line title:
+Executive Commentary – {market_unit} | {comparison_label}
+Then a blank line, then the paragraphs.
+- Do not say "the AI", "the model" or mention SQL/agents.
+"""
+
+        response = self.llm.generate(prompt, temperature=0.3)
+        print("\n================ POLISHED EXECUTIVE COMMENTARY ================")
+        print(response)
+        print("===============================================================\n")
+        return clean_commentary_text(response)
+
+    # =========================================================
     # MAIN ANALYSIS
     # =========================================================
 
