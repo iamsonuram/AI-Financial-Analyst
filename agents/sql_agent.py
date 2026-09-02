@@ -8,6 +8,38 @@ def _last_day_of_month(year, month):
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
+def build_window_period(start_date, end_date):
+    """
+    Build a single-window analysis period from calendar from/to dates.
+
+    Unlike build_date_period, this does NOT compute any previous/comparison
+    window. Date-range commentary is an investigation of the selected window
+    only: the engine analyses the financial activity that occurred within
+    [start_date, end_date] and explains movements *within* that range.
+
+    Returns a period dict with window=True, accepted by SQLAgent and
+    AnalystOrchestrator for the window analysis path.
+    """
+    if isinstance(start_date, str):
+        start_date = date.fromisoformat(start_date)
+    if isinstance(end_date, str):
+        end_date = date.fromisoformat(end_date)
+
+    if start_date > end_date:
+        raise ValueError("The 'From' date must not be after the 'To' date.")
+
+    return {
+        "mode": "custom",
+        "window": True,
+        "start": start_date.isoformat(),
+        "end": end_date.isoformat(),
+        "current_start": start_date.isoformat(),
+        "current_end": end_date.isoformat(),
+        "current_year": start_date.year,
+        "current_quarter": (start_date.month - 1) // 3 + 1,
+    }
+
+
 def build_date_period(start_date, end_date):
     """
     Build a custom analysis period from calendar from/to dates.
@@ -138,6 +170,15 @@ class SQLAgent:
     @classmethod
     def _period_condition(cls, period, which):
         """Build the SQL predicate selecting one side of the comparison period."""
+        if period.get("window"):
+            # Date-range window mode: there IS no comparison period. Only the
+            # selected window is ever queried, for any 'which'.
+            start = period["current_start"]
+            end = period["current_end"]
+            return (
+                f"(CAST(Booking_Date AS TEXT) >= '{start}' "
+                f"AND CAST(Booking_Date AS TEXT) <= '{end}')"
+            )
         if period.get("mode") == "custom":
             start = period[f"{which}_start"]
             end = period[f"{which}_end"]
@@ -219,6 +260,21 @@ class SQLAgent:
 
     @classmethod
     def _metric_columns(cls, period):
+        if period.get("window"):
+            # Date-range window mode: financial activity is measured *within*
+            # the selected window only. Change columns carry the within-window
+            # total so dimension ordering by magnitude works; no _Previous is
+            # produced (there is no comparison period to analyse).
+            pieces = []
+            for metric in cls.METRICS:
+                current = cls._period_sum(metric, period, "current")
+                pieces.extend(
+                    [
+                        f"{current} AS {metric}_Current",
+                        f"{current} AS {metric}_Change",
+                    ]
+                )
+            return ",\n".join(pieces)
         pieces = []
         for metric in cls.METRICS:
             current = cls._period_sum(metric, period, "current")
@@ -250,7 +306,14 @@ class SQLAgent:
             context_filters,
         )
 
-        if period.get("mode") == "custom":
+        if period.get("window"):
+            period_columns = ",\n".join(
+                [
+                    f"    '{period['current_start']}' AS Current_Start",
+                    f"    '{period['current_end']}' AS Current_End",
+                ]
+            )
+        elif period.get("mode") == "custom":
             period_columns = ",\n".join(
                 [
                     f"    '{period['current_start']}' AS Current_Start",
@@ -312,6 +375,42 @@ ORDER BY ABS(Technical_Result_Change) DESC;
 """
         return sql.strip()
 
+    def _generate_window_series_sql(
+        self,
+        period,
+        region,
+        market_unit,
+        focus_dimension=None,
+        focus_value=None,
+        context_filters=None,
+    ):
+        """Monthly breakdown of financial activity *within* the selected window.
+
+        Buckets bookings by Calendar month (substr of the ISO Booking_Date).
+        Used to detect within-window movements (spikes/dips/trends) without
+        comparing against any other period.
+        """
+        where_clause = self._build_where_clause(
+            period,
+            region,
+            market_unit,
+            focus_dimension,
+            focus_value,
+            context_filters,
+        )
+
+        sql = f"""
+SELECT
+    substr(CAST(Booking_Date AS TEXT), 1, 7) AS Month,
+    {self._metric_columns(period)},
+    COUNT(*) AS Record_Count
+FROM finance_data
+WHERE {where_clause}
+GROUP BY substr(CAST(Booking_Date AS TEXT), 1, 7)
+ORDER BY Month;
+"""
+        return sql.strip()
+
     def generate_sql(
         self,
         question,
@@ -344,6 +443,18 @@ ORDER BY ABS(Technical_Result_Change) DESC;
         if investigation_level in self.HIERARCHY:
             return self._generate_dimension_sql(
                 investigation_level,
+                period,
+                region,
+                market_unit,
+                focus_dimension,
+                focus_value,
+                context_filters,
+            )
+
+        if investigation_level == "Movement":
+            if not period.get("window"):
+                raise ValueError("Movement series is only available in window mode.")
+            return self._generate_window_series_sql(
                 period,
                 region,
                 market_unit,

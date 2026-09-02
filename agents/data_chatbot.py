@@ -165,15 +165,20 @@ INSTRUCTIONS:
 - If the result contains business dimensions, name the relevant ones.
 - If the data does not support a conclusion, say so clearly.
 - Keep the answer concise but sufficiently detailed.
-- Use plain text only. No Markdown, bullets, tables, LaTeX, asterisks or backticks.
+
+FORMATTING:
+- Respond in clean Markdown with proper spacing so the answer is easy to scan.
+- Use short sections with headings (e.g. '### Technical Result') where helpful.
+- Use short paragraphs and bullet lists with '-' for key points.
+- Use bold for the important figures and key findings only (e.g. **Technical Result:** $4.21M). Do not bold every sentence.
+- Always leave a space after bold markers so words never merge (write '**Premium** rose', never '**Premium**rose').
 - Format financial values clearly, e.g. $12.4M, -$3.2M, 84.5%.
+- Never use tables or LaTeX.
 - Never mention SQL, prompts, internal agents or implementation details.
 """
 
         answer = self.llm.generate(prompt, temperature=0.1)
-        answer = str(answer).strip()
-        answer = answer.replace("**", "").replace("__", "").replace("`", "").replace("*", "")
-        return answer
+        return str(answer).strip()
 
     def ask(self, question: str, region: str, market_unit: str) -> dict:
         question = (question or "").strip()

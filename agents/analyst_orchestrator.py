@@ -95,7 +95,18 @@ class AnalystOrchestrator:
 
     @staticmethod
     def _period_labels(period):
-        """Human-readable labels for the comparison period."""
+        """Human-readable labels for the analysis period."""
+        if period.get("window"):
+            # Date-range window mode: no comparison period exists. Every label
+            # describes the selected window and the label never says "versus".
+            current_label = (
+                f"{period['current_start']} to {period['current_end']}"
+            )
+            return {
+                "current_label": current_label,
+                "previous_label": current_label,
+                "comparison_label": current_label,
+            }
         if period.get("mode") == "custom":
             current_label = (
                 f"{period['current_start']} to {period['current_end']}"
@@ -242,6 +253,83 @@ class AnalystOrchestrator:
         return "remained broadly unchanged"
 
     # =========================================================
+    # WITHIN-WINDOW MOVEMENT HELPERS (DATE-RANGE MODE)
+    # =========================================================
+
+    @classmethod
+    def _within_window_movements(cls, series_df):
+        """Detect month-over-month movements within a window's monthly series.
+
+        The series_df is the "Movement" investigation result (one row per
+        calendar month, each with monthly *_Change / *_Current columns). We
+        compare consecutive months *within the window* to describe financial
+        activity that is happening inside the selected range. No comparison
+        against an outside period is ever made.
+        """
+        if series_df is None or series_df.empty:
+            return None
+        change_col = cls._find_change_column(series_df)
+        if change_col is None:
+            return None
+        month_col = cls._find_column(series_df, ["Month"])
+        if month_col is None:
+            return None
+
+        rows = series_df.sort_values(month_col).reset_index(drop=True)
+        movements = []
+        for idx, row in rows.iterrows():
+            value = cls._safe_float(row.get(change_col))
+            if value is None:
+                continue
+            if idx > 0:
+                prior = cls._safe_float(rows[change_col].iloc[idx - 1])
+                if prior is not None and abs(prior) > 1e-9:
+                    pct = (value - prior) / abs(prior) * 100.0
+                else:
+                    pct = None
+            else:
+                pct = None
+            movements.append(
+                {
+                    "month": str(row.get(month_col)),
+                    "value": value,
+                    "month_over_month_pct": pct,
+                }
+            )
+        if not movements:
+            return None
+        return {
+            "movements": movements,
+            "peak_month": max(movements, key=lambda m: m["value"]),
+            "trough_month": min(movements, key=lambda m: m["value"]),
+        }
+
+    @staticmethod
+    def _movement_bundle_text(window_movements):
+        """Plain-text description of within-window monthly movements for evidence."""
+        if not window_movements:
+            return "No monthly breakdown was available for the selected window."
+        lines = []
+        for m in window_movements["movements"]:
+            pct = (
+                f" ({m['month_over_month_pct']:.1f}% vs prior month in window)"
+                if m["month_over_month_pct"] is not None
+                else ""
+            )
+            lines.append(
+                f"Month {m['month']}: Technical Result {format_financial(m['value'])}{pct}"
+            )
+        lines.append(
+            f"Highest month in window: {window_movements['peak_month']['month']} "
+            f"({format_financial(window_movements['peak_month']['value'])})"
+        )
+        lines.append(
+            f"Lowest month in window: {window_movements['trough_month']['month']} "
+            f"({format_financial(window_movements['trough_month']['value'])})"
+        )
+        return "\n".join(lines)
+
+    # =========================================================
     # DRIVER SELECTION
     # =========================================================
 
@@ -382,6 +470,75 @@ class AnalystOrchestrator:
             "message": (
                 f"Selected {len(selected)} contributor(s), covering {coverage * 100:.1f}% "
                 f"of the parent Technical Result movement."
+            ),
+        }
+
+    @classmethod
+    def _select_absolute_movers(cls, dataframe, dimension, max_drivers=None):
+        """Select the largest absolute contributors (single-window mode).
+
+        In window mode there is no parent movement sign to align with, so we
+        select purely by absolute Technical Result magnitude within the window.
+        """
+        if dataframe is None or dataframe.empty:
+            return [], {
+                "target": cls.COVERAGE_TARGET,
+                "coverage": 0.0,
+                "parent_change": None,
+                "selected_change_sum": 0.0,
+                "aligned_change_sum": 0.0,
+                "message": "No data available for driver selection.",
+            }
+        dimension_col = cls._find_column(dataframe, [dimension])
+        change_col = cls._find_change_column(dataframe)
+        if dimension_col is None or change_col is None:
+            return [], {
+                "target": cls.COVERAGE_TARGET,
+                "coverage": 0.0,
+                "parent_change": None,
+                "selected_change_sum": 0.0,
+                "aligned_change_sum": 0.0,
+                "message": "Required dimension or Technical Result column is unavailable.",
+            }
+        max_drivers = max_drivers if max_drivers is not None else cls.MAX_DRIVERS
+        df = dataframe[[dimension_col, change_col]].copy()
+        df[change_col] = cls._numeric(df[change_col])
+        df = df.dropna(subset=[change_col])
+        df = df[df[dimension_col].notna()].copy()
+        if df.empty:
+            return [], {
+                "target": cls.COVERAGE_TARGET,
+                "coverage": 0.0,
+                "parent_change": None,
+                "selected_change_sum": 0.0,
+                "aligned_change_sum": 0.0,
+                "message": "No valid dimensional values were available.",
+            }
+        df = df.groupby(dimension_col, dropna=False, as_index=False)[change_col].sum()
+        df["_abs"] = df[change_col].abs()
+        df = df.sort_values("_abs", ascending=False).reset_index(drop=True)
+        selected_rows = df.head(max_drivers)
+        selected = []
+        for _, row in selected_rows.iterrows():
+            selected.append(
+                {
+                    "dimension": dimension,
+                    "driver": str(row[dimension_col]),
+                    "change": float(row[change_col]),
+                    "direction": "positive" if row[change_col] > 0 else "negative" if row[change_col] < 0 else "neutral",
+                    "absolute_change": float(row["_abs"]),
+                }
+            )
+        total = float(df[change_col].sum())
+        selected_sum = float(sum(x["change"] for x in selected))
+        return selected, {
+            "target": cls.COVERAGE_TARGET,
+            "coverage": (selected_sum / total) if total != 0 else 0.0,
+            "parent_change": None,
+            "selected_change_sum": selected_sum,
+            "aligned_change_sum": total,
+            "message": (
+                f"Selected {len(selected)} largest in-window contributor(s) by absolute magnitude."
             ),
         }
 
@@ -765,6 +922,105 @@ class AnalystOrchestrator:
 
         return "\n\n".join(parts)
 
+    @classmethod
+    def _build_window_evidence(
+        cls,
+        period,
+        region,
+        market_unit,
+        overall_tr,
+        window_dataframe,
+        window_metrics,
+        window_movements,
+        mlob_results,
+        portfolio_results,
+        cedent_results,
+        renewal_results,
+    ):
+        """Evidence for the date-range (window) commentary.
+
+        The date-range mode is an investigation *of the selected period*:
+        it reports the financial activity within [start, end], the material
+        activity at each drill-down level (MLOB -> Portfolio -> Cedent ->
+        Renewal/New Business/Cancelled), and the within-window monthly
+        movements. It NEVER references a comparison period.
+        """
+        parts = []
+        labels = cls._period_labels(period)
+        window_label = labels["current_label"]
+
+        parts.append(
+            f"MARKET CONTEXT\nRegion: {region}\nMarket Unit: {market_unit}\n"
+            f"Selected window: {window_label}\n"
+            f"Technical Result within the window: {format_financial(overall_tr)}\n"
+            f"Within-window financial activity is reported below."
+        )
+        parts.append(
+            "WINDOW FINANCIAL CONTEXT\n"
+            "The figures below are the totals recorded within the selected window.\n"
+            + cls._format_metric_evidence(window_metrics)
+        )
+        parts.append(
+            "WINDOW RESULT TABLE\n" + cls._compact_dataframe(window_dataframe, 5)
+        )
+        parts.append("WITHIN-WINDOW MONTHLY MOVEMENT\n" + cls._movement_bundle_text(window_movements))
+
+        parts.append("MAIN LINE OF BUSINESS ACTIVITY")
+        for item in mlob_results:
+            parts.append(
+                f"MLOB ACTIVITY\n"
+                f"{item['dimension']} = {item['driver']}\n"
+                f"Technical Result in window: {format_financial(item['change'])}\n"
+                f"Direction: {item['direction']}\n"
+                f"Share of market TR activity: {item['coverage'] * 100:.1f}%"
+            )
+
+        for item in portfolio_results:
+            parts.append(
+                f"UW PORTFOLIO ACTIVITY\n"
+                f"MLOB: {item['parent_value']}\n"
+                f"Parent MLOB TR in window: {format_financial(item.get('parent_change'))}\n"
+                f"Portfolio: {item['driver']}\n"
+                f"Portfolio TR in window: {format_financial(item['change'])}\n"
+                f"Share within MLOB: {item['coverage'] * 100:.1f}%\n"
+                f"Result table:\n{cls._compact_dataframe(item['data'], 12)}"
+            )
+
+        for item in cedent_results:
+            parts.append(
+                f"CEDENT ACTIVITY\n"
+                f"MLOB: {item['mlob']}\n"
+                f"UW Portfolio: {item['portfolio']}\n"
+                f"Parent portfolio TR in window: {format_financial(item['parent_change'])}\n"
+                f"Cedent: {item['driver']}\n"
+                f"Cedent TR in window: {format_financial(item['change'])}\n"
+                f"Share within portfolio: {item['coverage'] * 100:.1f}%\n"
+                f"Result table:\n{cls._compact_dataframe(item['data'], 12)}"
+            )
+
+        for item in renewal_results:
+            parts.append(
+                f"RENEWAL / NEW BUSINESS / CANCELLED ACTIVITY\n"
+                f"MLOB: {item['mlob']}\n"
+                f"UW Portfolio: {item['portfolio']}\n"
+                f"Cedent: {item['cedent']}\n"
+                f"Parent cedent TR in window: {format_financial(item['parent_change'])}\n"
+                f"All available business categories are retained below.\n"
+                f"Result table:\n{cls._compact_dataframe(item['data'], 12)}"
+            )
+
+        parts.append(
+            "INTERPRETATION RULES FOR COMMENTARY\n"
+            "Describe the financial activity observed WITHIN the selected window. "
+            "Explain which months or sub-periods within the window show the largest "
+            "movements, and which Main Line of Business, UW Portfolio, Cedent and "
+            "business category (New Business/Renewal/Cancelled) drove them. "
+            "Do NOT compare the selected window against any other period and do not "
+            "invent a root cause the evidence does not support."
+        )
+
+        return "\n\n".join(parts)
+
     @staticmethod
     def _format_metric_evidence(metrics):
         if not metrics:
@@ -978,6 +1234,183 @@ Then a blank line, then the paragraphs.
         print("\n================ POLISHED EXECUTIVE COMMENTARY ================")
         print(response)
         print("===============================================================\n")
+        return clean_commentary_text(response)
+
+    def _generate_window_commentary(
+        self,
+        region,
+        market_unit,
+        period,
+        overall_tr,
+        window_movements,
+        evidence,
+    ):
+        """Windowing executive commentary.
+
+        This is an investigation of the selected date range: it explains what
+        financial activity occurred within the window and the material drivers
+        at each level. It NEVER compares the window against another period.
+        """
+        labels = self._period_labels(period)
+        window_label = labels["current_label"]
+        movement_text = self._movement_bundle_text(window_movements)
+
+        prompt = f"""
+You are a senior P&C Finance analyst writing an executive commentary for management
+about financial activity within a specific date range.
+
+Market Unit: {market_unit}
+Region: {region}
+Selected window: {window_label}
+
+This is a single-window investigation. The figures represent the financial activity
+recorded WITHIN the selected date range only. Do not compare this window against any
+previous, next or equivalent period. Investigate what happened inside this window.
+
+EVIDENCE
+========
+{evidence}
+========
+
+WRITE THE COMMENTARY
+
+Write 4 to 6 short paragraphs.
+
+Paragraph 1: State the overall Technical Result within the window and the most
+important financial context from Premium, Claims, Commission and Expenses recorded
+in that range.
+
+Paragraph 2: Describe the within-window monthly movements, calling out the months
+with the largest positive or negative Technical Result within the range. Use only
+the actual monthly figures. {movement_text}
+
+Paragraph 3: Explain the Main Lines of Business that drove the activity within the
+window. Mention multiple MLOBs when they collectively explain a substantial share.
+
+Paragraph 4: Explain the material UW Portfolios and Cedents and which MLOB and
+UW Portfolio each belongs to.
+
+Paragraph 5: Explain the Renewal/New Business/Cancelled pattern within the window.
+Distinguish whether the activity is associated with new business, renewals,
+cancellations, or a combination.
+
+Final paragraph: Give a practical management recommendation grounded in the observed
+in-window evidence.
+
+IMPORTANT ANALYTICAL RULES
+1. Do not say "versus", "compared with", "prior period" or "previous period".
+   This is not a comparison.
+2. Do not invent a root cause that is not in the evidence.
+3. Financial values should be expressed in readable units such as $16.22M or -$7.39M.
+4. Say "within the selected period" when describing the analysis scope.
+
+OUTPUT FORMAT — VERY IMPORTANT
+Return plain text only.
+Do NOT use Markdown.
+Do NOT use #, *, **, _, __, backticks, bullet points, numbered lists, tables, LaTeX, HTML, or emojis.
+Do NOT use mathematical notation.
+Use normal words and currency values directly.
+Start with exactly this one-line title:
+Executive Commentary – {market_unit} | {window_label}
+Then a blank line and the paragraphs.
+Do not add any other heading.
+Do not mention that you are an AI.
+Do not mention SQL or the investigation process.
+"""
+
+        response = self.llm.generate(prompt)
+        print("\n================ WINDOW EXECUTIVE COMMENTARY ================")
+        print(response)
+        print("=============================================================\n")
+        return clean_commentary_text(response)
+
+    def _polish_window_commentary(
+        self,
+        region,
+        market_unit,
+        window_label,
+        market_unit_kpis,
+        detailed_commentary,
+    ):
+        """Window-specific polished commentary (date-range / single-window story)."""
+        kpi_lines = []
+        if market_unit_kpis:
+            for label, value in market_unit_kpis.items():
+                kpi_lines.append(f"- {label}: {str(value).strip()[:100]}")
+        kpi_text = "\n".join(kpi_lines) if kpi_lines else "No KPIs available."
+
+        if not detailed_commentary:
+            detailed_commentary = "No detailed analysis available."
+
+        prompt = f"""
+You are an executive business storyteller, not a data summarizer.
+Transform the analytical output below into a short, clear Executive Commentary
+that explains what happened within the selected date range and why.
+Write for a business user who may not be an insurance/reinsurance expert.
+The reader should understand the story without needing to interpret tables or
+numbers.
+
+Market Unit: {market_unit}
+Region: {region}
+Selected period: {window_label}
+
+The analysis below is a single-window investigation: it describes financial
+activity recorded WITHIN the selected date range only. Do NOT compare it against
+any other period.
+
+MARKET-LEVEL KPIs (dashboard snapshot)
+=======================================
+{kpi_text}
+=======================================
+
+DETAILED ANALYSIS (ground truth; do not contradict it)
+=======================================
+{detailed_commentary}
+=======================================
+
+Follow this structure naturally:
+
+1. Start by describing the overall financial activity observed within the
+   selected period.
+2. Explain the main driver(s) of that activity.
+3. Identify the 2-3 Lines of Business that contributed most and briefly explain
+   what happened within them.
+4. Mention portfolio or account/cedent-level drivers only when they materially
+   explain the activity. Do not list every portfolio or cedent.
+5. Explain whether the activity is mainly related to new business, renewals,
+   cancellations, claims, or premium movement.
+6. End with a concise business takeaway or area that deserves attention.
+
+WRITING RULES
+- Tell a story, do not reproduce the analysis.
+- Prioritize meaning over numbers. Use numbers only when they help explain the
+  story. Format values in readable units such as $1.23B, $45.6M and 79.3%.
+- Use simple, natural business language.
+- Do NOT use the words "versus", "compared with", "prior period" or "previous
+  period", and do not reference any period outside the selected window.
+- Do not invent causes, recommendations, relationships, or facts that are not
+  present in the analytical input.
+- Keep the commentary concise: 3-5 short paragraphs, approximately 250-350 words
+  maximum.
+
+Above all, answer this question through the narrative:
+
+"What financial activity happened within this selected date range, what drove it,
+where did it happen, and what should the reader pay attention to?"
+
+FORMATTING
+- Do not use Markdown, bullets, asterisks, backticks, tables, headings or
+  emojis. Return plain text only.
+- Start with exactly this one-line title:
+Executive Commentary – {market_unit} | {window_label}
+Then a blank line, then the paragraphs.
+- Do not say "the AI", "the model" or mention SQL/agents.
+"""
+
+        response = self.llm.generate(prompt, temperature=0.3)
+        print("\n================ POLISHED WINDOW COMMENTARY ================")
+        print(response)
+        print("=============================================================\n")
         return clean_commentary_text(response)
 
     # =========================================================
@@ -1425,6 +1858,497 @@ Then a blank line, then the paragraphs.
             "commentary": commentary,
             "chart": None,
             "rows": len(quarter_df),
+            "execution_time": round(time.time() - start_time, 3),
+            "driver_summary": {
+                "main_line_of_business": selected_mlob,
+                "uw_portfolios": selected_portfolios,
+                "cedents": selected_cedents,
+                "renewal_analyses": renewal_evidence,
+            },
+        }
+
+    def analyze_window(
+        self,
+        question,
+        region,
+        market_unit,
+        period,
+        progress_callback=None,
+    ):
+        """Single-window date-range analysis.
+
+        Investigates the financial activity WITHIN [period.current_start,
+        period.current_end] only. There is no previous period: the aim is to
+        explain what happened inside the selected window, not to compare it
+        against another period.
+
+        Flow mirrors analyze() but uses direct window totals (no _Previous)
+        so the same result_history/polish path stays compatible downstream.
+        """
+        start_time = time.time()
+        labels = self._period_labels(period)
+        window_label = labels["current_label"]
+
+        sql_history = []
+        result_history = []
+        investigation_history = []
+        next_number = 1
+
+        self._send_progress(
+            progress_callback,
+            {
+                "type": "window",
+                "current_year": period.get("current_year"),
+                "current_quarter": period.get("current_quarter"),
+                "previous_year": period.get("previous_year"),
+                "previous_quarter": period.get("previous_quarter"),
+                "label": window_label,
+            },
+        )
+
+        # ---------------------------------------------------------
+        # 1. Window totals + daily/monthly movement series
+        # ---------------------------------------------------------
+        window_question = (
+            f"Summarize Premium, Claims, Commission, Expenses and Technical Result "
+            f"recorded within {window_label} for the selected market."
+        )
+        window_result = self._run_investigation(
+            number=next_number,
+            level="Quarter",
+            question=window_question,
+            region=region,
+            market_unit=market_unit,
+            period=period,
+            progress_callback=progress_callback,
+            sql_history=sql_history,
+            result_history=result_history,
+            investigation_history=investigation_history,
+        )
+        if window_result is None:
+            return self._failure("The window analysis could not be completed.", sql_history, result_history)
+
+        window_df = window_result["data"]
+        overall_tr = self._safe_float(window_df["Technical_Result_Current"].iloc[0])
+        if overall_tr is None:
+            overall_tr = self._overall_change(window_df)
+        window_metrics = self._metric_snapshot(window_df)
+        investigation_history.append(
+            {
+                "investigation": next_number,
+                "level": "Quarter",
+                "focus_dimension": None,
+                "focus_value": None,
+                "selected_drivers": [],
+                "coverage": 1.0,
+                "change": overall_tr,
+                "direction": self._movement_direction(overall_tr),
+                "evidence_status": "window_total",
+            }
+        )
+        next_number += 1
+
+        # Within-window monthly movements (no comparison to any outside period).
+        movement_result = self._run_investigation(
+            number=next_number,
+            level="Movement",
+            question=(
+                f"Break the Technical Result within {window_label} into monthly buckets "
+                f"to detect within-window movements for the selected market."
+            ),
+            region=region,
+            market_unit=market_unit,
+            period=period,
+            progress_callback=progress_callback,
+            sql_history=sql_history,
+            result_history=result_history,
+            investigation_history=investigation_history,
+        )
+        window_movements = None
+        if movement_result is not None:
+            window_movements = self._within_window_movements(movement_result["data"])
+        if window_movements:
+            investigation_history.append(
+                {
+                    "investigation": next_number,
+                    "level": "Movement",
+                    "focus_dimension": None,
+                    "focus_value": None,
+                    "selected_drivers": [],
+                    "coverage": 1.0,
+                    "change": overall_tr,
+                    "direction": self._movement_direction(overall_tr),
+                    "evidence_status": "within_window_movement",
+                }
+            )
+        next_number += 1
+
+        # ---------------------------------------------------------
+        # 2. Main Line of Business activity (within-window totals)
+        # ---------------------------------------------------------
+        mlob_question = (
+            f"Summarize Technical Result by Main_Line_of_Business recorded within "
+            f"{window_label}. Identify material contributors to the window's "
+            f"{format_financial(overall_tr)} Technical Result."
+        )
+        mlob_result = self._run_investigation(
+            number=next_number,
+            level="Main_Line_of_Business",
+            question=mlob_question,
+            region=region,
+            market_unit=market_unit,
+            period=period,
+            progress_callback=progress_callback,
+            sql_history=sql_history,
+            result_history=result_history,
+            investigation_history=investigation_history,
+        )
+        if mlob_result is None:
+            return self._failure("Main Line of Business analysis could not be completed.", sql_history, result_history)
+
+        mlob_df = mlob_result["data"]
+        # Single-window mode: select material activity by absolute magnitude.
+        selected_mlob, mlob_coverage = self._select_material_drivers(
+            mlob_df,
+            "Main_Line_of_Business",
+            overall_tr if overall_tr else 0.0,
+        )
+        if not selected_mlob:
+            # window mode uses absolute magnitudes; fall back to largest movers.
+            selected_mlob, mlob_coverage = self._select_absolute_movers(mlob_df, "Main_Line_of_Business")
+        self._send_driver_event(progress_callback, next_number, "Main_Line_of_Business", selected_mlob, mlob_coverage)
+        investigation_history.append(
+            {
+                "investigation": next_number,
+                "level": "Main_Line_of_Business",
+                "focus_dimension": None,
+                "focus_value": None,
+                "selected_drivers": selected_mlob,
+                "coverage": mlob_coverage.get("coverage", 0.0),
+                "change": overall_tr,
+                "direction": self._movement_direction(overall_tr),
+                "evidence_status": "window_driver_selection",
+            }
+        )
+        next_number += 1
+
+        mblob_evidence = []
+        for driver in selected_mlob:
+            mblob_evidence.append(
+                {
+                    "dimension": "Main_Line_of_Business",
+                    "driver": driver["driver"],
+                    "change": driver["change"],
+                    "direction": driver["direction"],
+                    "coverage": mlob_coverage.get("coverage", 0.0),
+                }
+            )
+
+        # ---------------------------------------------------------
+        # 3. UW portfolios for each selected MLOB
+        # ---------------------------------------------------------
+        portfolio_evidence = []
+        selected_portfolios = []
+
+        for mlob in selected_mlob:
+            value = mlob["driver"]
+            q = (
+                f"Summarize Technical Result by UW_Portfolio within Main_Line_of_Business "
+                f"'{value}' recorded within {window_label}."
+            )
+            result = self._run_investigation(
+                number=next_number,
+                level="UW_Portfolio",
+                question=q,
+                region=region,
+                market_unit=market_unit,
+                period=period,
+                focus_dimension="Main_Line_of_Business",
+                focus_value=value,
+                progress_callback=progress_callback,
+                sql_history=sql_history,
+                result_history=result_history,
+                investigation_history=investigation_history,
+            )
+            if result is None:
+                next_number += 1
+                continue
+
+            df = result["data"]
+            selected, coverage = self._select_material_drivers(
+                df,
+                "UW_Portfolio",
+                mlob["change"] if mlob["change"] else 0.0,
+            )
+            if not selected:
+                selected, coverage = self._select_absolute_movers(df, "UW_Portfolio")
+            self._send_driver_event(progress_callback, next_number, "UW_Portfolio", selected, coverage, parent_value=value)
+            investigation_history.append(
+                {
+                    "investigation": next_number,
+                    "level": "UW_Portfolio",
+                    "focus_dimension": "Main_Line_of_Business",
+                    "focus_value": value,
+                    "selected_drivers": selected,
+                    "coverage": coverage.get("coverage", 0.0),
+                    "change": mlob["change"],
+                    "direction": mlob["direction"],
+                    "evidence_status": "window_driver_selection",
+                }
+            )
+            next_number += 1
+
+            for portfolio in selected:
+                selected_portfolios.append(
+                    {
+                        **portfolio,
+                        "mlob": value,
+                        "parent_change": mlob["change"],
+                    }
+                )
+                portfolio_evidence.append(
+                    {
+                        **portfolio,
+                        "parent_value": value,
+                        "parent_change": mlob["change"],
+                        "coverage": coverage.get("coverage", 0.0),
+                        "data": df.copy(),
+                    }
+                )
+
+        # ---------------------------------------------------------
+        # 4. Cedents for each selected portfolio
+        # ---------------------------------------------------------
+        cedent_evidence = []
+        selected_cedents = []
+
+        for portfolio in selected_portfolios:
+            mlob = portfolio["mlob"]
+            portfolio_name = portfolio["driver"]
+            q = (
+                f"Summarize Technical Result by Cedent_Name within Main_Line_of_Business "
+                f"'{mlob}' and UW_Portfolio '{portfolio_name}' recorded within {window_label}."
+            )
+            result = self._run_investigation(
+                number=next_number,
+                level="Cedent_Name",
+                question=q,
+                region=region,
+                market_unit=market_unit,
+                period=period,
+                context_filters={
+                    "Main_Line_of_Business": mlob,
+                    "UW_Portfolio": portfolio_name,
+                },
+                progress_callback=progress_callback,
+                sql_history=sql_history,
+                result_history=result_history,
+                investigation_history=investigation_history,
+            )
+            if result is None:
+                next_number += 1
+                continue
+
+            df = result["data"]
+            selected, coverage = self._select_material_drivers(
+                df,
+                "Cedent_Name",
+                portfolio["change"] if portfolio["change"] else 0.0,
+            )
+            if not selected:
+                selected, coverage = self._select_absolute_movers(df, "Cedent_Name")
+            self._send_driver_event(
+                progress_callback,
+                next_number,
+                "Cedent_Name",
+                selected,
+                coverage,
+                parent_value=portfolio_name,
+            )
+            investigation_history.append(
+                {
+                    "investigation": next_number,
+                    "level": "Cedent_Name",
+                    "focus_dimension": "UW_Portfolio",
+                    "focus_value": portfolio_name,
+                    "parent_mlob": mlob,
+                    "selected_drivers": selected,
+                    "coverage": coverage.get("coverage", 0.0),
+                    "change": portfolio["change"],
+                    "direction": portfolio["direction"],
+                    "evidence_status": "window_driver_selection",
+                }
+            )
+            next_number += 1
+
+            for cedent in selected:
+                selected_cedents.append(
+                    {
+                        **cedent,
+                        "mlob": mlob,
+                        "portfolio": portfolio_name,
+                        "parent_change": portfolio["change"],
+                    }
+                )
+                cedent_evidence.append(
+                    {
+                        **cedent,
+                        "mlob": mlob,
+                        "portfolio": portfolio_name,
+                        "parent_change": portfolio["change"],
+                        "coverage": coverage.get("coverage", 0.0),
+                        "data": df.copy(),
+                    }
+                )
+
+        # ---------------------------------------------------------
+        # 5. Renewal / New Business / Cancelled for each selected cedent
+        # ---------------------------------------------------------
+        renewal_evidence = []
+
+        seen = set()
+        for cedent in selected_cedents:
+            key = (cedent["mlob"], cedent["portfolio"], cedent["driver"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            mlob, portfolio, cedent_name = key
+            q = (
+                f"Summarize Technical Result by Renewal_Category for Cedent_Name "
+                f"'{cedent_name}', UW_Portfolio '{portfolio}' and Main_Line_of_Business "
+                f"'{mlob}' recorded within {window_label}. Show New Business, Renewal "
+                f"and Cancelled activity."
+            )
+            result = self._run_investigation(
+                number=next_number,
+                level="Renewal_Category",
+                question=q,
+                region=region,
+                market_unit=market_unit,
+                period=period,
+                context_filters={
+                    "Main_Line_of_Business": mlob,
+                    "UW_Portfolio": portfolio,
+                    "Cedent_Name": cedent_name,
+                },
+                progress_callback=progress_callback,
+                sql_history=sql_history,
+                result_history=result_history,
+                investigation_history=investigation_history,
+            )
+            if result is None:
+                next_number += 1
+                continue
+
+            df = result["data"]
+            categories = self._select_all_categories(df)
+            self._send_progress(
+                progress_callback,
+                {
+                    "type": "driver_selected",
+                    "investigation": next_number,
+                    "level": "Renewal_Category",
+                    "drivers": categories,
+                    "coverage": 1.0,
+                    "selection_rule": "All available business categories retained for interpretation.",
+                },
+            )
+            investigation_history.append(
+                {
+                    "investigation": next_number,
+                    "level": "Renewal_Category",
+                    "focus_dimension": "Cedent_Name",
+                    "focus_value": cedent_name,
+                    "parent_mlob": mlob,
+                    "parent_portfolio": portfolio,
+                    "selected_drivers": categories,
+                    "coverage": 1.0,
+                    "change": cedent["change"],
+                    "direction": cedent["direction"],
+                    "evidence_status": "all_business_categories",
+                }
+            )
+            renewal_evidence.append(
+                {
+                    "mlob": mlob,
+                    "portfolio": portfolio,
+                    "cedent": cedent_name,
+                    "parent_change": cedent["change"],
+                    "data": df.copy(),
+                    "categories": categories,
+                }
+            )
+            next_number += 1
+
+        # ---------------------------------------------------------
+        # Final evidence and commentary
+        # ---------------------------------------------------------
+        evidence = self._build_window_evidence(
+            period=period,
+            region=region,
+            market_unit=market_unit,
+            overall_tr=overall_tr,
+            window_dataframe=window_df,
+            window_metrics=window_metrics,
+            window_movements=window_movements,
+            mlob_results=mblob_evidence,
+            portfolio_results=portfolio_evidence,
+            cedent_results=cedent_evidence,
+            renewal_results=renewal_evidence,
+        )
+
+        self._send_progress(
+            progress_callback,
+            {
+                "type": "commentary_generating",
+                "message": "All material activity collected. Generating executive commentary...",
+            },
+        )
+
+        try:
+            commentary = self._generate_window_commentary(
+                region=region,
+                market_unit=market_unit,
+                period=period,
+                overall_tr=overall_tr,
+                window_movements=window_movements,
+                evidence=evidence,
+            )
+        except Exception as exc:
+            commentary = (
+                f"Executive Commentary – {market_unit} | {window_label}\n\n"
+                f"Within the selected period the Technical Result was {format_financial(overall_tr)}. "
+                f"Detailed commentary generation failed: {exc}"
+            )
+
+        self._send_progress(
+            progress_callback,
+            {
+                "type": "commentary_ready",
+                "commentary": commentary,
+            },
+        )
+
+        return {
+            "success": True,
+            "region": region,
+            "market_unit": market_unit,
+            "current_year": period.get("current_year"),
+            "current_quarter": period.get("current_quarter"),
+            "previous_year": period.get("previous_year"),
+            "previous_quarter": period.get("previous_quarter"),
+            "period_mode": "custom",
+            "window": True,
+            "overall_change": overall_tr,
+            "movement_direction": self._movement_direction(overall_tr),
+            "sql_history": sql_history,
+            "result_history": result_history,
+            "investigation_history": investigation_history,
+            "investigations": len(result_history),
+            "commentary": commentary,
+            "chart": None,
+            "rows": len(window_df),
             "execution_time": round(time.time() - start_time, 3),
             "driver_summary": {
                 "main_line_of_business": selected_mlob,
